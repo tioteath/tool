@@ -1,0 +1,39 @@
+#!/bin/sh
+## track amazon's ip ranges; update iptables rules
+
+# Don't add heading/trailing spaces in variables
+PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+URI='https://ip-ranges.amazonaws.com/ip-ranges.json'
+COMMENT='AMAZON'
+TMP='/tmp'
+CACHE_PREFIX="${TMP}/.amazon.rule"
+RULE_PREFIX='INPUT -s'
+RULE_POSTFIX="-m comment --comment ${COMMENT} -j ACCEPT"
+SANITY_CHECK_LIMIT=100
+FAIL=0
+
+die() { printf -- "$@\n" >&2; exit 1; }
+
+if type curl > /dev/null 2>&1; then
+  GET="curl --silent $URI"
+else if type wget > /dev/null 2>&1; then
+  GET="wget --quiet $URI -O-"
+else
+  printf -- "Could not run: neither \`curl' nor \`wget' is available"
+fi;fi
+
+iptables-save | grep "comment ${COMMENT}" | sed 's/^-A //' | sort | uniq \
+    > $CACHE_PREFIX.old
+
+$GET | grep 'ip_prefix":' | \
+    sed "s/^\s*\"ip_prefix\":\s*\"/$RULE_PREFIX /; s/\",$/ ${RULE_POSTFIX}/" \
+    | sort | uniq > ${CACHE_PREFIX}.new
+
+# Sanity check
+test $(cat ${CACHE_PREFIX}.new | wc -l) -gt $SANITY_CHECK_LIMIT \
+    || die "New IP ranges list contains less than ${SANITY_CHECK_LIMIT} entries"
+
+diff ${CACHE_PREFIX}.old ${CACHE_PREFIX}.new | grep $COMMENT \
+    | sed 's/^>/ -I/; s/^</ -D/' | xargs -L1 iptables
+
+rm -f $CACHE_PREFIX*
