@@ -1,39 +1,60 @@
 #!/bin/sh
 ## track amazon's ip ranges; update iptables rules
-
-# Don't add heading/trailing spaces in variables
-PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
-URI='https://ip-ranges.amazonaws.com/ip-ranges.json'
-COMMENT='AMAZON'
-TMP='/tmp'
-CACHE_PREFIX="${TMP}/.amazon.rule"
-RULE_PREFIX='INPUT -s'
-RULE_POSTFIX="-m comment --comment ${COMMENT} -j ACCEPT"
-SANITY_CHECK_LIMIT=100
-FAIL=0
-
 die() { printf -- "$@\n" >&2; exit 1; }
 
+_tmp=$(mktemp -d)
+trap "test -d $_tmp && rm --force --recursive $_tmp && exit" INT TERM EXIT
+
+set -e
+test -n "${DEBUG}" && set -x
+_uri='https://ip-ranges.amazonaws.com/ip-ranges.json'
+_region=${REGION:-'us-east-1'}
+_comment="managed by $(basename $0)"
+
+_sanity_check_limit=100
+
+# pass CIDR
+rule() {
+  _action=$1 # delete/append
+  _ip_range=$2
+  iptables --table filter --$_action INPUT --match state --state NEW  \
+           --source $_ip_range --jump ACCEPT \
+           --match comment --comment "$_comment"
+}
+
 if type curl > /dev/null 2>&1; then
-  GET="curl --silent $URI"
+  _fetch="curl --silent $_uri"
 else if type wget > /dev/null 2>&1; then
-  GET="wget --quiet $URI -O-"
+  _fetch="wget --quiet $_uri -O-"
 else
-  printf -- "Could not run: neither \`curl' nor \`wget' is available"
+  printf -- "Unable to run: neither \`curl' nor \`wget' is available"
 fi;fi
 
-iptables-save | grep "comment ${COMMENT}" | sed 's/^-A //' | sort | uniq \
-    > $CACHE_PREFIX.old
-
-$GET | grep 'ip_prefix":' | \
-    sed "s/^\s*\"ip_prefix\":\s*\"/$RULE_PREFIX /; s/\",$/ ${RULE_POSTFIX}/" \
-    | sort | uniq > ${CACHE_PREFIX}.new
+$_fetch | tr -d '"\n ' \
+        | tr '{}' '\n' \
+        | grep "ip_prefix:.*region:$_region" \
+        | sed 's/^ip_prefix:\([ 0-9\.\/]*\),.*/\1/g; s#/32##g' \
+        | sort --unique \
+        > $_tmp/range-list.new
 
 # Sanity check
-test $(cat ${CACHE_PREFIX}.new | wc -l) -gt $SANITY_CHECK_LIMIT \
-    || die "New IP ranges list contains less than ${SANITY_CHECK_LIMIT} entries"
+_range_count=$(wc --lines < $_tmp/range-list.new)
+test $_range_count -ge $_sanity_check_limit \
+    || die "Expected to obtain at least ${_sanity_check_limit} of ranges, " \
+           "got ${_range_count}"
 
-diff ${CACHE_PREFIX}.old ${CACHE_PREFIX}.new | grep $COMMENT \
-    | sed 's/^>/ -I/; s/^</ -D/' | xargs -L1 iptables
+iptables  --list  --numeric \
+  | grep --fixed-strings "$_comment" \
+  | tr --squeeze-repeats ' ' \
+  | cut --delimiter=' ' --fields=4 \
+  | sort >  $_tmp/range-list.current
 
-rm -f $CACHE_PREFIX*
+# Add missing ranges
+for _range in $(comm --check-order -13 $_tmp/range-list.current $_tmp/range-list.new); do
+  rule append $_range
+done
+
+# Remove outdated ranges
+for _range in $(comm --check-order -23 $_tmp/range-list.current $_tmp/range-list.new); do
+  rule delete $_range
+done
